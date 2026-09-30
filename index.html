@@ -502,6 +502,9 @@
           front.textContent = "Loading vocabulary…";
           back.textContent = "";
           cardInner.classList.remove("flipped");
+          const loadingNoticeTimer = setTimeout(() => {
+            front.textContent = "Still loading vocabulary… Please wait.";
+          }, 8000);
 
           try {
             const data = await bridgeRequest({
@@ -530,6 +533,8 @@
             back.textContent = "";
             viewIndexes = [];
             studyRetryControls.hidden = false;
+          } finally {
+            clearTimeout(loadingNoticeTimer);
           }
         }
 
@@ -624,7 +629,7 @@
         }
 
         // Only read requests time out. Writes are never retried automatically.
-        const READ_TIMEOUT_MS = 15000;
+        const READ_TIMEOUT_MS = 45000;
 
         async function requestBridgeText(options = {}, timeoutMs = 0) {
           const controller = timeoutMs ? new AbortController() : null;
@@ -918,6 +923,9 @@
           front.classList.remove('error');
           front.textContent = "Loading available Days…";
           back.textContent = "";
+          const loadingNoticeTimer = setTimeout(() => {
+            front.textContent = "Still connecting… Please wait.";
+          }, 8000);
 
           try {
             // These setup reads are independent. Apply the access limit
@@ -926,6 +934,7 @@
               loadBridgeStatus(),
               bridgeRequest({ action: 'days' })
             ]);
+            clearTimeout(loadingNoticeTimer);
             const studySheets = Array.isArray(data.studySheets)
               ? data.studySheets
               : data.days || [];
@@ -965,6 +974,7 @@
             back.textContent = "";
             studyRetryControls.hidden = false;
           } finally {
+            clearTimeout(loadingNoticeTimer);
             retryStudyBtn.disabled = false;
           }
         }
