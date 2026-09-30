@@ -457,7 +457,8 @@
         shuffleBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           shuffleOn = !shuffleOn;
-          shuffleBtn.textContent = shuffleOn ? '🔁 Reshuffle' : '🔀 Shuffle';
+          shuffleBtn.textContent = shuffleOn ? '🔁 Original Order' : '🔀 Shuffle';
+          shuffleBtn.title = shuffleOn ? 'Return cards to original order' : 'Shuffle order';
           rebuildView(true);
         });
         modeSelect.addEventListener('change', () => { isFlipped = false; rebuildView(true); });
