@@ -41,6 +41,7 @@
     }
     .flashcard-back { transform: rotateY(180deg); background:#fbfbff; }
     .buttons { display:flex; gap:10px; justify-content:center; margin: 10px 0 18px; }
+    .buttons[hidden] { display:none; }
     .buttons button { padding:10px 14px; border-radius:12px; border:1px solid #ccc; cursor:pointer; }
     .study-controls { display:flex; flex-direction:column; gap:8px; align-items:center; margin-top:10px; }
     .study-controls .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; justify-content:center; }
@@ -204,6 +205,10 @@
       </div>
     </div>
 
+    <div class="buttons" id="studyRetryControls" hidden>
+      <button id="retryStudyBtn" type="button">Retry Loading</button>
+    </div>
+
     </section>
 
     <section class="view-panel" id="manageView" hidden>
@@ -283,6 +288,8 @@
         const resetBtn   = document.getElementById('resetProgressBtn');
         const rateReviewBtn  = document.getElementById('rateReview');
         const rateLearnedBtn = document.getElementById('rateLearned');
+        const studyRetryControls = document.getElementById('studyRetryControls');
+        const retryStudyBtn = document.getElementById('retryStudyBtn');
 
         // Dictionary helper UI
         const dictHelper = document.getElementById('dictHelper');
@@ -490,8 +497,9 @@
             return;
           }
 
+          studyRetryControls.hidden = true;
           front.classList.remove('error');
-          front.textContent = "Loading…";
+          front.textContent = "Loading vocabulary…";
           back.textContent = "";
           cardInner.classList.remove("flipped");
 
@@ -521,6 +529,7 @@
             front.textContent = "Error loading data.\n\n" + error.message;
             back.textContent = "";
             viewIndexes = [];
+            studyRetryControls.hidden = false;
           }
         }
 
@@ -614,40 +623,60 @@
           return (localStorage.getItem(BRIDGE_TOKEN_KEY) || '').trim();
         }
 
-        async function loadBridgeStatus() {
-          try {
-            const response = await fetch(BRIDGE_URL, { cache: 'no-store' });
-            const data = await response.json();
+        // Only read requests time out. Writes are never retried automatically.
+        const READ_TIMEOUT_MS = 15000;
 
-            const maxAccessibleDay = Number(data.maxAccessibleDay);
-
-            if (
-              data.ok &&
-              Number.isInteger(maxAccessibleDay) &&
-              maxAccessibleDay >= 1 &&
-              maxAccessibleDay <= 100
-            ) {
-              courseDays = maxAccessibleDay;
-            }
-          } catch (error) {
-            console.warn('[Bridge] Status unavailable; Day access remains locked.', error);
-          }
-        }
-
-        async function bridgeRequest(payload, attempt = 0) {
-          const retryableActions = ['days', 'list', 'study'];
-          const mayRetry = retryableActions.includes(payload.action);
-          const maxAttempts = mayRetry ? 3 : 1;
+        async function requestBridgeText(options = {}, timeoutMs = 0) {
+          const controller = timeoutMs ? new AbortController() : null;
+          const timer = controller
+            ? setTimeout(() => controller.abort(), timeoutMs)
+            : null;
 
           try {
             const response = await fetch(BRIDGE_URL, {
+              ...options,
+              cache: 'no-store',
+              ...(controller ? { signal: controller.signal } : {})
+            });
+            if (!response.ok) {
+              throw new Error('The Bridge is temporarily unavailable.');
+            }
+            // Keep the timeout active until the response body has arrived.
+            return await response.text();
+          } catch (error) {
+            if (controller && controller.signal.aborted) {
+              throw new Error('Loading took too long. Please try again.');
+            }
+            throw error;
+          } finally {
+            if (timer !== null) clearTimeout(timer);
+          }
+        }
+
+        async function loadBridgeStatus() {
+          const data = JSON.parse(await requestBridgeText({}, READ_TIMEOUT_MS));
+          const maxAccessibleDay = Number(data.maxAccessibleDay);
+
+          if (
+            !data.ok ||
+            !Number.isInteger(maxAccessibleDay) ||
+            maxAccessibleDay < 1 ||
+            maxAccessibleDay > 100
+          ) {
+            throw new Error('The Bridge could not confirm the available lesson days.');
+          }
+          courseDays = maxAccessibleDay;
+        }
+
+        async function bridgeRequest(payload) {
+          const isRead = ['days', 'list', 'study'].includes(payload.action);
+
+          try {
+            const responseText = await requestBridgeText({
               method: 'POST',
               headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-              body: JSON.stringify(payload),
-              cache: 'no-store'
-            });
-
-            const responseText = await response.text();
+              body: JSON.stringify(payload)
+            }, isRead ? READ_TIMEOUT_MS : 0);
             let data;
 
             try {
@@ -657,26 +686,16 @@
             }
 
             if (!data.ok) {
-              throw new Error(
-                data.error || 'The request could not be completed.'
-              );
+              throw new Error(data.error || 'The request could not be completed.');
             }
-
             return data;
           } catch (error) {
-            if (attempt + 1 < maxAttempts) {
-              const delay = 750 * (attempt + 1);
-              await new Promise((resolve) => setTimeout(resolve, delay));
-              return bridgeRequest(payload, attempt + 1);
-            }
-
-            if (!mayRetry) {
+            if (!isRead) {
               throw new Error(
                 'The Bridge response was interrupted. The change may still ' +
                 'have been saved. Refresh the list before trying again.'
               );
             }
-
             throw error;
           }
         }
@@ -893,11 +912,20 @@
         });
 
         // ========= 10) Init =========
-        (async function init(){
-          try {
-            await loadBridgeStatus();
+        async function initializeStudy() {
+          retryStudyBtn.disabled = true;
+          studyRetryControls.hidden = true;
+          front.classList.remove('error');
+          front.textContent = "Loading available Days…";
+          back.textContent = "";
 
-            const data = await bridgeRequest({ action: 'days' });
+          try {
+            // These setup reads are independent. Apply the access limit
+            // before populating the dropdown or requesting vocabulary.
+            const [, data] = await Promise.all([
+              loadBridgeStatus(),
+              bridgeRequest({ action: 'days' })
+            ]);
             const studySheets = Array.isArray(data.studySheets)
               ? data.studySheets
               : data.days || [];
@@ -908,6 +936,7 @@
                 "No accessible Study sheets were found.\n\n" +
                 "Check the administrative Day limit and Bridge deployment.";
               back.textContent = "";
+              studyRetryControls.hidden = false;
               return;
             }
 
@@ -915,6 +944,10 @@
 
             const availableNames = Array.from(dropdown.options)
               .map((option) => option.value);
+
+            if (!availableNames.length) {
+              throw new Error('No lesson days are available within the access limit.');
+            }
 
             const defaultName = availableNames.includes('Day 1')
               ? 'Day 1'
@@ -930,8 +963,27 @@
             front.textContent =
               "Startup error.\n\n" + err.message;
             back.textContent = "";
+            studyRetryControls.hidden = false;
+          } finally {
+            retryStudyBtn.disabled = false;
           }
-        })();
+        }
+
+        retryStudyBtn.addEventListener('click', async () => {
+          if (retryStudyBtn.disabled) return;
+          retryStudyBtn.disabled = true;
+          try {
+            if (dropdown.value && courseDays > 0) {
+              await loadBySheet(dropdown.value);
+            } else {
+              await initializeStudy();
+            }
+          } finally {
+            retryStudyBtn.disabled = false;
+          }
+        });
+
+        initializeStudy();
       });
     </script>
   </div>
