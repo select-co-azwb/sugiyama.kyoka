@@ -260,11 +260,11 @@
         const BRIDGE_URL = 'https://script.google.com/macros/s/AKfycbxpFRJH_TCEIA5SbFzhOrZuD4W3II6l6numpcXK6NLkyrLw5C3hXS2u_r5v7eSC1Yrk/exec';
 
         // Allow-list
-        let courseDays = 0; // Safe fallback; the bridge supplies the administrative limit.
+        const releasedDays = new Set(); // Only Days explicitly released by the Bridge.
         const EXTRA_TABS = ["A-Z Word Bank", "Everyday Phrasal Verbs", "Business Phrasal Verbs", "Proverbs"];
         const isAllowedStudySheet = (name) => {
           const match = name.match(/^Day\s+(\d+)$/i);
-          if (match) return Number(match[1]) <= courseDays;
+          if (match) return releasedDays.has(name);
           return EXTRA_TABS.includes(name);
         };
 
@@ -614,26 +614,6 @@
           return (localStorage.getItem(BRIDGE_TOKEN_KEY) || '').trim();
         }
 
-        async function loadBridgeStatus() {
-          try {
-            const response = await fetch(BRIDGE_URL, { cache: 'no-store' });
-            const data = await response.json();
-
-            const maxAccessibleDay = Number(data.maxAccessibleDay);
-
-            if (
-              data.ok &&
-              Number.isInteger(maxAccessibleDay) &&
-              maxAccessibleDay >= 1 &&
-              maxAccessibleDay <= 100
-            ) {
-              courseDays = maxAccessibleDay;
-            }
-          } catch (error) {
-            console.warn('[Bridge] Status unavailable; Day access remains locked.', error);
-          }
-        }
-
         async function bridgeRequest(payload, attempt = 0) {
           const retryableActions = ['days', 'list', 'study'];
           const mayRetry = retryableActions.includes(payload.action);
@@ -660,6 +640,19 @@
               throw new Error(
                 data.error || 'The request could not be completed.'
               );
+            }
+
+            if (payload.action === 'days' && (
+              data.action !== 'days' ||
+              !Array.isArray(data.days) ||
+              !data.days.every((name) => typeof name === 'string' &&
+                /^Day\s+([1-9]\d?|100)$/.test(name)) ||
+              (data.studySheets !== undefined && (
+                !Array.isArray(data.studySheets) ||
+                !data.studySheets.every((name) => typeof name === 'string')
+              ))
+            )) {
+              throw new Error('The Bridge did not return the released Day list.');
             }
 
             return data;
@@ -895,9 +888,9 @@
         // ========= 10) Init =========
         (async function init(){
           try {
-            await loadBridgeStatus();
-
             const data = await bridgeRequest({ action: 'days' });
+            releasedDays.clear();
+            data.days.forEach((name) => releasedDays.add(name));
             const studySheets = Array.isArray(data.studySheets)
               ? data.studySheets
               : data.days || [];
