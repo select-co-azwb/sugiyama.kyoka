@@ -149,6 +149,12 @@
       <button class="view-tab" id="manageTab" type="button" role="tab" aria-selected="false">Add &amp; Manage</button>
     </div>
 
+    <section id="connectionDiagnostics" hidden style="text-align:left;padding:12px;border:1px solid #aaa;border-radius:10px;margin:12px 0">
+      <strong>Connection check — Sugiyama</strong>
+      <p>Requests stop after 15 seconds. This check records timing and response types, without vocabulary.</p>
+      <pre id="connectionLog" style="white-space:pre-wrap;font-size:13px"></pre>
+    </section>
+
     <section class="view-panel" id="studyView">
 
     <div>
@@ -240,6 +246,7 @@
             <div class="manage-actions">
               <button class="primary" id="saveEntryBtn" type="submit">Add Vocabulary</button>
               <button id="cancelEditBtn" type="button" hidden>Cancel Edit</button>
+              <button id="refreshListBtn" type="button">Refresh List</button>
             </div>
           </form>
 
@@ -305,6 +312,7 @@
         const manageDefinition = document.getElementById('manageDefinition');
         const saveEntryBtn = document.getElementById('saveEntryBtn');
         const cancelEditBtn = document.getElementById('cancelEditBtn');
+        const refreshListBtn = document.getElementById('refreshListBtn');
         const manageStatus = document.getElementById('manageStatus');
         const entryListHeading = document.getElementById('entryListHeading');
         const entryList = document.getElementById('entryList');
@@ -314,6 +322,10 @@
         let manageReady = false;
         let editingRow = null;
         let studyNeedsRefresh = false;
+        let manageEntries = [];
+        let manageLoadedSheet = '';
+        let manageLoadSequence = 0;
+        let manageWriteBusy = false;
 
         // --- Duplicate detection (per current deck) ---
         let duplicateCounts = null;
@@ -614,20 +626,54 @@
           return (localStorage.getItem(BRIDGE_TOKEN_KEY) || '').trim();
         }
 
-        async function bridgeRequest(payload, attempt = 0) {
+        const CONNECTION_TIMEOUT_MS = 15000;
+        const connectionLog = document.getElementById('connectionLog');
+        const connectionDiagnostics = document.getElementById('connectionDiagnostics');
+        const showConnectionCheck = new URLSearchParams(location.search).get('diagnostics') === '1';
+        connectionDiagnostics.hidden = !showConnectionCheck;
+        const connectionEvents = [];
+        const connectionStarted = Date.now();
+        function recordConnection(action, phase, details = '') {
+          const line = ((Date.now() - connectionStarted) / 1000).toFixed(1) +
+            's | ' + action + ' | ' + phase + (details ? ' | ' + details : '');
+          connectionEvents.push(line);
+          if (connectionEvents.length > 30) connectionEvents.shift();
+          if (showConnectionCheck) connectionLog.textContent = connectionEvents.join('\n');
+          console.log('[Connection]', line);
+        }
+
+        async function bridgeRequest(payload) {
           const retryableActions = ['days', 'list', 'study'];
           const mayRetry = retryableActions.includes(payload.action);
-          const maxAttempts = mayRetry ? 3 : 1;
+          const controller = new AbortController();
+          let timedOut = false;
+          let serverRejected = false;
+          let deadline;
+          recordConnection(payload.action, 'request started');
+          const timeout = new Promise((_, reject) => {
+            deadline = setTimeout(() => {
+              timedOut = true;
+              controller.abort();
+              reject(new Error('Connection timed out after 15 seconds.'));
+            }, CONNECTION_TIMEOUT_MS);
+          });
 
           try {
-            const response = await fetch(BRIDGE_URL, {
+            const transfer = (async () => {
+              const response = await fetch(BRIDGE_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'text/plain;charset=utf-8' },
               body: JSON.stringify(payload),
-              cache: 'no-store'
+              cache: 'no-store',
+              signal: controller.signal
             });
-
-            const responseText = await response.text();
+              recordConnection(payload.action, 'response headers',
+                'HTTP ' + response.status + '; redirected=' + response.redirected);
+              const responseText = await response.text();
+              if (!response.ok) throw new Error('HTTP ' + response.status);
+              return responseText;
+            })();
+            const responseText = await Promise.race([transfer, timeout]);
             let data;
 
             try {
@@ -636,9 +682,12 @@
               throw new Error('The Bridge returned an unexpected response.');
             }
 
-            if (!data.ok) {
+            recordConnection(payload.action, 'reply parsed',
+              'action=' + (data && data.action || 'missing') + '; ok=' + Boolean(data && data.ok));
+            if (!data || !data.ok) {
+              serverRejected = Boolean(data && data.ok === false && typeof data.error === 'string');
               throw new Error(
-                data.error || 'The request could not be completed.'
+                data && data.error || 'The request could not be completed.'
               );
             }
 
@@ -655,14 +704,36 @@
               throw new Error('The Bridge did not return the released Day list.');
             }
 
-            return data;
-          } catch (error) {
-            if (attempt + 1 < maxAttempts) {
-              const delay = 750 * (attempt + 1);
-              await new Promise((resolve) => setTimeout(resolve, delay));
-              return bridgeRequest(payload, attempt + 1);
+            if (payload.action === 'list' && (
+              data.action !== 'list' || data.sheet !== payload.sheet ||
+              !Array.isArray(data.entries) ||
+              !data.entries.every((entry) => entry &&
+                Number.isInteger(entry.row) && entry.row >= 2 &&
+                typeof entry.word === 'string' && typeof entry.definition === 'string')
+            )) {
+              throw new Error('The Bridge did not return the vocabulary list.');
+            }
+            if (payload.action === 'study' && (
+              data.action !== 'study' || data.sheet !== payload.sheet ||
+              !Array.isArray(data.cards) ||
+              !data.cards.every((pair) => Array.isArray(pair) && pair.length === 2 &&
+                pair.every((value) => typeof value === 'string'))
+            )) {
+              throw new Error('The Bridge did not return the study cards.');
+            }
+            if (!mayRetry && (
+              data.action !== payload.action || data.sheet !== payload.sheet ||
+              !Number.isInteger(data.row) || data.row < 2 ||
+              (payload.action !== 'add' && data.row !== payload.row)
+            )) {
+              throw new Error('The Bridge did not confirm the change.');
             }
 
+            recordConnection(payload.action, 'confirmed');
+            return data;
+          } catch (error) {
+            recordConnection(payload.action, timedOut ? 'timed out' : 'failed', error.message);
+            if (serverRejected) throw error;
             if (!mayRetry) {
               throw new Error(
                 'The Bridge response was interrupted. The change may still ' +
@@ -670,7 +741,12 @@
               );
             }
 
+            if (timedOut) {
+              throw new Error('Connection timed out after 15 seconds. Please try again when the connection is working.');
+            }
             throw error;
+          } finally {
+            clearTimeout(deadline);
           }
         }
 
@@ -717,7 +793,9 @@
           setManageStatus('Loading available Days…');
 
           try {
-            const data = await bridgeRequest({ action: 'days' });
+            const data = releasedDays.size
+              ? { days: Array.from(releasedDays) }
+              : await bridgeRequest({ action: 'days' });
             manageDaySelector.innerHTML = '';
 
             data.days.forEach((name) => {
@@ -754,17 +832,55 @@
           await initializeManageView();
         });
 
+        function setManageWriteBusy(busy) {
+          manageWriteBusy = busy;
+          manageDaySelector.disabled = busy;
+          saveEntryBtn.disabled = busy || manageLoadedSheet !== manageDaySelector.value;
+          cancelEditBtn.disabled = busy;
+          refreshListBtn.disabled = busy;
+          entryList.querySelectorAll('button').forEach((button) => {
+            button.disabled = busy;
+          });
+        }
+
+        function applyConfirmedEntryChange(payload, result) {
+          if (manageLoadedSheet !== payload.sheet) {
+            throw new Error('The selected Day changed. Refresh the list.');
+          }
+          if (payload.action === 'delete') {
+            manageEntries = manageEntries.filter((entry) => entry.row !== result.row);
+          } else {
+            const updated = {
+              row: result.row,
+              word: payload.word,
+              definition: payload.definition
+            };
+            manageEntries = manageEntries.filter((entry) => entry.row !== result.row);
+            manageEntries.push(updated);
+            manageEntries.sort((a, b) => a.row - b.row);
+          }
+          renderManageEntries(manageEntries);
+        }
+
         async function loadManageEntries() {
           const sheet = manageDaySelector.value;
-          if (!sheet) return;
-
+          if (!sheet || manageWriteBusy) return;
+          const sequence = ++manageLoadSequence;
+          manageLoadedSheet = '';
+          saveEntryBtn.disabled = true;
           entryListHeading.textContent = `Vocabulary for ${sheet}`;
           entryList.textContent = 'Loading…';
 
           try {
             const data = await bridgeRequest({ action: 'list', sheet });
-            renderManageEntries(data.entries || []);
+            if (sequence !== manageLoadSequence || sheet !== manageDaySelector.value) return;
+            manageEntries = data.entries;
+            manageLoadedSheet = sheet;
+            studyNeedsRefresh = true;
+            renderManageEntries(manageEntries);
+            saveEntryBtn.disabled = false;
           } catch (error) {
+            if (sequence !== manageLoadSequence || sheet !== manageDaySelector.value) return;
             entryList.textContent = '';
             setManageStatus(error.message, 'error');
           }
@@ -813,21 +929,25 @@
             deleteButton.className = 'delete-entry';
             deleteButton.textContent = 'Delete';
             deleteButton.addEventListener('click', async () => {
+              if (manageWriteBusy || manageLoadedSheet !== manageDaySelector.value) return;
               if (!confirm(`Delete “${entry.word}” from ${manageDaySelector.value}?`)) return;
-
+              const payload = {
+                action: 'delete',
+                sheet: manageDaySelector.value,
+                row: entry.row
+              };
+              setManageWriteBusy(true);
               setManageStatus('Deleting…');
               try {
-                await bridgeRequest({
-                  action: 'delete',
-                  sheet: manageDaySelector.value,
-                  row: entry.row
-                });
+                const result = await bridgeRequest(payload);
+                applyConfirmedEntryChange(payload, result);
                 studyNeedsRefresh = true;
                 resetEntryForm();
                 setManageStatus('Vocabulary deleted.', 'success');
-                await loadManageEntries();
               } catch (error) {
                 setManageStatus(error.message, 'error');
+              } finally {
+                setManageWriteBusy(false);
               }
             });
 
@@ -846,6 +966,13 @@
           await loadManageEntries();
         });
 
+        refreshListBtn.addEventListener('click', async () => {
+          if (manageWriteBusy) return;
+          resetEntryForm();
+          setManageStatus('');
+          await loadManageEntries();
+        });
+
         cancelEditBtn.addEventListener('click', () => {
           resetEntryForm();
           setManageStatus('Edit cancelled.');
@@ -853,6 +980,7 @@
 
         entryForm.addEventListener('submit', async (event) => {
           event.preventDefault();
+          if (manageWriteBusy || manageLoadedSheet !== manageDaySelector.value) return;
 
           const word = manageWord.value.trim();
           const definition = manageDefinition.value.trim();
@@ -866,22 +994,22 @@
 
           if (editingRow !== null) payload.row = editingRow;
 
-          saveEntryBtn.disabled = true;
+          setManageWriteBusy(true);
           setManageStatus(action === 'add' ? 'Adding…' : 'Saving changes…');
 
           try {
-            await bridgeRequest(payload);
+            const result = await bridgeRequest(payload);
+            applyConfirmedEntryChange(payload, result);
             studyNeedsRefresh = true;
             resetEntryForm();
             setManageStatus(
               action === 'add' ? 'Vocabulary added.' : 'Changes saved.',
               'success'
             );
-            await loadManageEntries();
           } catch (error) {
             setManageStatus(error.message, 'error');
           } finally {
-            saveEntryBtn.disabled = false;
+            setManageWriteBusy(false);
           }
         });
 
